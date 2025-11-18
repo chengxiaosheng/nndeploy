@@ -116,3 +116,7 @@ endif()
 if(ENABLE_NNDEPLOY_PLUGIN_MATTING)
   include(${ROOT_PATH}/demo/matting/config.cmake)
 endif()
+
+if(ENABLE_NNDEPLOY_PLUGIN_DETECT)
+  include(${ROOT_PATH}/demo/yolo_rtsp/config.cmake)
+endif()

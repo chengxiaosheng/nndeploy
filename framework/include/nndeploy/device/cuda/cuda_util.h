@@ -120,13 +120,22 @@ inline void cudaDumpDeviceProperty(std::ostream &os, const cudaDeviceProp &p) {
   }
   os << '\n';
 
+  os << "Total constant memory:         " << p.totalConstMem << '\n'
+     << "Texture alignment:             " << p.textureAlignment << '\n';
+
+#if CUDART_VERSION < 12000
+  // These fields were deprecated and removed in CUDA 12.0
   os << "Clock rate:                    " << p.clockRate << '\n'
-     << "Total constant memory:         " << p.totalConstMem << '\n'
-     << "Texture alignment:             " << p.textureAlignment << '\n'
-     << "Concurrent copy and execution: " << p.deviceOverlap << '\n'
-     << "Number of multiprocessors:     " << p.multiProcessorCount << '\n'
-     << "Kernel execution timeout:      " << p.kernelExecTimeoutEnabled << '\n'
-     << "GPU sharing Host Memory:       " << p.integrated << '\n'
+     << "Concurrent copy and execution: " << p.deviceOverlap << '\n';
+#endif
+
+  os << "Number of multiprocessors:     " << p.multiProcessorCount << '\n';
+
+#if CUDART_VERSION < 12000
+  os << "Kernel execution timeout:      " << p.kernelExecTimeoutEnabled << '\n';
+#endif
+
+  os << "GPU sharing Host Memory:       " << p.integrated << '\n'
      << "Host page-locked mem mapping:  " << p.canMapHostMemory << '\n'
      << "Alignment for Surfaces:        " << p.surfaceAlignment << '\n'
      << "Device has ECC support:        " << p.ECCEnabled << '\n'
