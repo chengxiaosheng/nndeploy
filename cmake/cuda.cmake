@@ -74,6 +74,8 @@ macro(find_cuda use_cuda use_cudnn)
         ${CUDA_TOOLKIT_ROOT_DIR}/lib64
         ${CUDA_TOOLKIT_ROOT_DIR}/lib
         NO_DEFAULT_PATH)
+      # search default path if cannot find curand in non-default
+      find_library(CUDA_CURAND_LIBRARY curand)
       find_library(CUDA_CUBLAS_LIBRARY cublas
         ${CUDA_TOOLKIT_ROOT_DIR}/lib64
         ${CUDA_TOOLKIT_ROOT_DIR}/lib
