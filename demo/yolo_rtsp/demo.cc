@@ -28,6 +28,13 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// CUDA drawing kernels
+#include <cuda_runtime.h>
+#include "cuda_draw.h"
+
+// OpenGL display for GPU-direct rendering
+#include "gl_display.h"
+
 using namespace nndeploy;
 
 // 全局标志：是否启用实时显示
@@ -366,7 +373,7 @@ class RtspVideoDecode : public codec::Decode {
 };
 
 /**
- * @brief 可视化检测结果节点 - 在图像上画框并标注
+ * @brief 可视化检测结果节点 - GPU加速绘图 + OpenGL显示
  */
 class VisDetection : public dag::Node {
  public:
@@ -374,10 +381,39 @@ class VisDetection : public dag::Node {
                std::vector<dag::Edge *> outputs)
       : dag::Node(name, inputs, outputs) {
     key_ = "nndeploy::demo::VisDetection";
-    desc_ = "Visualize detection results with bounding boxes and labels";
+    desc_ = "Visualize detection results with GPU drawing and OpenGL display";
   }
 
   virtual ~VisDetection() {}
+
+  // 静态OpenGL显示器（所有帧共享）
+  static GLDisplay* gl_display_;
+  static bool gl_initialized_;
+
+  virtual base::Status init() override {
+    // 初始化OpenGL显示器（只初始化一次）
+    if (!gl_initialized_ && g_enable_display) {
+      gl_display_ = new GLDisplay(1920, 1080, "YOLO Detection (Full GPU)");
+      if (!gl_display_->init()) {
+        NNDEPLOY_LOGE("Failed to initialize OpenGL display\n");
+        delete gl_display_;
+        gl_display_ = nullptr;
+        return base::kStatusCodeErrorNotSupport;
+      }
+      gl_initialized_ = true;
+      NNDEPLOY_LOGI("✅ OpenGL GPU display initialized\n");
+    }
+    return base::kStatusCodeOk;
+  }
+
+  virtual base::Status deinit() override {
+    if (gl_display_) {
+      delete gl_display_;
+      gl_display_ = nullptr;
+      gl_initialized_ = false;
+    }
+    return base::kStatusCodeOk;
+  }
 
   virtual base::Status run() {
     // 获取输入：原始图像和检测结果
@@ -386,33 +422,13 @@ class VisDetection : public dag::Node {
         (detect::DetectResult *)(inputs_[1]->getParam(this));
 
     if (input_mat == nullptr || detect_result == nullptr) {
-      NNDEPLOY_LOGE("Input is nullptr");
+      NNDEPLOY_LOGE("Input is nullptr\n");
       return base::kStatusCodeErrorNullParam;
     }
 
-    // 创建输出图像（使用new分配，Edge会管理生命周期）
-    cv::Mat *output_mat = new cv::Mat();
-    input_mat->copyTo(*output_mat);
-
-    // 获取图像尺寸（用于坐标缩放）
+    // 获取图像尺寸
     int img_w = input_mat->cols;
     int img_h = input_mat->rows;
-
-    // COCO数据集的类别名称（80类）
-    static const std::vector<std::string> class_names = {
-        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
-        "truck", "boat", "traffic light", "fire hydrant", "stop sign",
-        "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
-        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
-        "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
-        "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
-        "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
-        "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
-        "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-        "couch", "potted plant", "bed", "dining table", "toilet", "tv",
-        "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
-        "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
-        "scissors", "teddy bear", "hair drier", "toothbrush"};
 
     // 颜色映射（为不同类别生成不同颜色）
     auto getColor = [](int class_id) -> cv::Scalar {
@@ -421,71 +437,133 @@ class VisDetection : public dag::Node {
                         (offset + 170) % 255);
     };
 
-    // 绘制每个检测框
+    // ========== 完全GPU流水线（零CPU参与）==========
+    size_t bgr_size = img_w * img_h * 3;
+    size_t rgba_size = img_w * img_h * sizeof(uchar4);
+
+    // 1. 分配GPU内存（持久化，避免每帧分配）
+    static unsigned char* d_bgr = nullptr;
+    static uchar4* d_rgba = nullptr;
+    static int last_w = 0, last_h = 0;
+
+    if (d_bgr == nullptr || last_w != img_w || last_h != img_h) {
+      if (d_bgr) cudaFree(d_bgr);
+      if (d_rgba) cudaFree(d_rgba);
+
+      cudaMalloc(&d_bgr, bgr_size);
+      cudaMalloc(&d_rgba, rgba_size);
+      last_w = img_w;
+      last_h = img_h;
+    }
+
+    // 2. 上传BGR图像到GPU（CPU→GPU传输）
+    cudaMemcpy(d_bgr, input_mat->data, bgr_size, cudaMemcpyHostToDevice);
+
+    // 3. 转换BGR→RGBA（GPU操作）
+    cudaBGRToRGBA(d_bgr, d_rgba, img_w, img_h, 0);
+
+    // 4. 在GPU上绘制所有检测框
     for (size_t i = 0; i < detect_result->bboxs_.size(); ++i) {
       const auto &bbox_result = detect_result->bboxs_[i];
       const auto &bbox = bbox_result.bbox_;
       int class_id = bbox_result.label_id_;
       float score = bbox_result.score_;
 
-      // 调试信息：打印检测框坐标
+      // 调试信息：每30帧打印一次
       static int debug_count = 0;
-      if (debug_count++ % 30 == 0) {
-        NNDEPLOY_LOGI("Drawing bbox[%zu]: class=%d, score=%.2f, coords=[%.1f,%.1f,%.1f,%.1f]",
-                      i, class_id, score, bbox[0], bbox[1], bbox[2], bbox[3]);
+      if (debug_count++ % 30 == 0 && i == 0) {
+        NNDEPLOY_LOGI("GPU Drawing %zu objects, first bbox: class=%d, score=%.2f\n",
+                      detect_result->bboxs_.size(), class_id, score);
       }
 
-      // 将归一化坐标转换为像素坐标（YOLO输出是0-1的归一化坐标）
-      float x1 = bbox[0] * img_w;
-      float y1 = bbox[1] * img_h;
-      float x2 = bbox[2] * img_w;
-      float y2 = bbox[3] * img_h;
+      // 将归一化坐标转换为像素坐标
+      int x1 = static_cast<int>(bbox[0] * img_w);
+      int y1 = static_cast<int>(bbox[1] * img_h);
+      int x2 = static_cast<int>(bbox[2] * img_w);
+      int y2 = static_cast<int>(bbox[3] * img_h);
 
-      // 绘制矩形框
+      // 获取颜色
       cv::Scalar color = getColor(class_id);
-      cv::rectangle(*output_mat, cv::Point(x1, y1),
-                    cv::Point(x2, y2), color, 2);
 
-      // 准备标签文本
-      std::string label = class_names[class_id] + ": " +
-                          std::to_string(score).substr(0, 4);
-
-      // 绘制标签背景
-      int baseline;
-      cv::Size label_size =
-          cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-      cv::rectangle(*output_mat, cv::Point(x1, y1 - label_size.height - 5),
-                    cv::Point(x1 + label_size.width, y1), color, -1);
-
-      // 绘制标签文本
-      cv::putText(*output_mat, label, cv::Point(x1, y1 - 5),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+      // 调用GPU绘制矩形框（CUDA kernel）
+      cudaDrawRectangle(d_rgba, img_w, img_h,
+                        x1, y1, x2, y2,
+                        static_cast<unsigned char>(color[2]),  // R
+                        static_cast<unsigned char>(color[1]),  // G
+                        static_cast<unsigned char>(color[0]),  // B
+                        2, 0);
     }
 
-    // 添加FPS显示
-    static auto last_time = std::chrono::high_resolution_clock::now();
-    auto current_time = std::chrono::high_resolution_clock::now();
-    double fps = 1000.0 / std::chrono::duration_cast<std::chrono::milliseconds>(
-                              current_time - last_time)
-                              .count();
-    last_time = current_time;
+    // 5. 使用OpenGL显示（GPU→GL纹理，零拷贝）
+    if (g_enable_display && gl_display_) {
+      // 5.1 渲染图像纹理到屏幕
+      gl_display_->render(d_rgba);
 
-    std::string fps_text = "FPS: " + std::to_string((int)fps);
-    cv::putText(*output_mat, fps_text, cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+      // COCO类别名称
+      static const std::vector<std::string> class_names = {
+          "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+          "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+          "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+          "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+          "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+          "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+          "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+          "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+          "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+          "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+          "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+          "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+          "scissors", "teddy bear", "hair drier", "toothbrush"};
 
-    // 实时显示（根据全局标志控制）
-    if (g_enable_display) {
-      cv::imshow("YOLO Detection", *output_mat);
-      // waitKey延迟控制帧率，降低CPU占用
-      // 1ms = ~1000 FPS (CPU全速), 30ms = ~33 FPS (流畅), 16ms = ~60 FPS
-      int key = cv::waitKey(16);  // 30ms延迟，降低CPU占用
-      // 按 'q' 或 ESC 退出
-      if (key == 'q' || key == 27) {
-        NNDEPLOY_LOGI("User requested exit (pressed 'q' or ESC)");
-        // 注意：这里无法直接停止graph，只能记录状态
+      // 5.2 在GPU上绘制文字标签（叠加在图像上）
+      for (size_t i = 0; i < detect_result->bboxs_.size(); ++i) {
+        const auto &bbox_result = detect_result->bboxs_[i];
+        const auto &bbox = bbox_result.bbox_;
+        int class_id = bbox_result.label_id_;
+        float score = bbox_result.score_;
+
+        float x1 = bbox[0] * img_w;
+        float y1 = bbox[1] * img_h;
+
+        // 准备标签文本
+        std::string label = class_names[class_id] + ": " +
+                            std::to_string(score).substr(0, 4);
+
+        // GPU绘制文字（白色）
+        gl_display_->renderText(label, x1, y1 - 5, 0.5f, 1.0f, 1.0f, 1.0f);
+      }
+
+      // 5.3 绘制FPS（左上角，绿色）
+      static auto last_fps_time = std::chrono::high_resolution_clock::now();
+      static int fps_counter = 0;
+      static float current_fps = 0.0f;
+      fps_counter++;
+
+      if (fps_counter % 30 == 0) {
+        auto now = std::chrono::high_resolution_clock::now();
+        double elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - last_fps_time).count();
+        current_fps = 30000.0f / elapsed_ms;
+        last_fps_time = now;
+      }
+
+      std::string fps_text = "FPS: " + std::to_string((int)current_fps);
+      gl_display_->renderText(fps_text, 10, 30, 1.0f, 0.0f, 1.0f, 0.0f);  // 绿色
+
+      // 5.4 所有绘制完成，交换缓冲区
+      gl_display_->present();
+
+      // 检查窗口关闭
+      if (gl_display_->shouldClose()) {
+        NNDEPLOY_LOGI("OpenGL window closed by user\n");
       }
     }
+
+    // 6. 为后续节点创建输出（如果需要保存文件）
+    // 注意：这里需要下载回CPU（仅用于文件保存）
+    cv::Mat *output_mat = new cv::Mat(img_h, img_w, CV_8UC3);
+    cudaRGBAToBGR(d_rgba, d_bgr, img_w, img_h, 0);
+    cudaMemcpy(output_mat->data, d_bgr, bgr_size, cudaMemcpyDeviceToHost);
 
     // 输出结果（用于保存到文件）
     outputs_[0]->set(output_mat, false);
@@ -493,6 +571,10 @@ class VisDetection : public dag::Node {
     return base::kStatusCodeOk;
   }
 };
+
+// 定义静态成员
+GLDisplay* VisDetection::gl_display_ = nullptr;
+bool VisDetection::gl_initialized_ = false;
 
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineNonHelpFlags(&argc, &argv, true);
@@ -503,28 +585,28 @@ int main(int argc, char *argv[]) {
 
   // 解析命令行参数
   std::string name = demo::getName();
-  NNDEPLOY_LOGI("Name: %s", name.c_str());
+  NNDEPLOY_LOGI("Name: %s\n", name.c_str());
 
   base::InferenceType inference_type = demo::getInferenceType();
-  NNDEPLOY_LOGI("Got inference type");
+  NNDEPLOY_LOGI("Got inference type\n");
 
   base::DeviceType device_type;
   try {
     device_type = demo::getDeviceType();
-    NNDEPLOY_LOGI("Got device type: %s", base::deviceTypeToString(device_type).c_str());
+    NNDEPLOY_LOGI("Got device type: %s\n", base::deviceTypeToString(device_type).c_str());
   } catch (...) {
-    NNDEPLOY_LOGE("Failed to get device type, using default CPU");
+    NNDEPLOY_LOGE("Failed to get device type, using default CPU\n");
     device_type = base::DeviceType();
     device_type.code_ = base::kDeviceTypeCodeCpu;
     device_type.device_id_ = 0;
   }
 
   base::ModelType model_type = demo::getModelType();
-  NNDEPLOY_LOGI("Got model type");
+  NNDEPLOY_LOGI("Got model type\n");
 
   bool is_path = demo::isPath();
   std::vector<std::string> model_value = demo::getModelValue();
-  NNDEPLOY_LOGI("Model path: %s", model_value.empty() ? "none" : model_value[0].c_str());
+  NNDEPLOY_LOGI("Model path: %s\n", model_value.empty() ? "none" : model_value[0].c_str());
 
   std::string input_path = demo::getInputPath();    // RTSP URL
   std::string output_path = demo::getOutputPath();  // 输出文件路径
@@ -537,88 +619,88 @@ int main(int argc, char *argv[]) {
   // 如果output_path是"-"，表示只显示不保存
   if (output_path == "-") {
     g_enable_display = true;
-    NNDEPLOY_LOGI("Display mode: Real-time window only (no file output)");
+    NNDEPLOY_LOGI("Display mode: Real-time window only (no file output)\n");
   } else if (output_path.empty()) {
     // 如果没有指定output_path，默认只显示
     g_enable_display = true;
     save_to_file = false;
-    NNDEPLOY_LOGI("Display mode: Real-time window only (no output path specified)");
+    NNDEPLOY_LOGI("Display mode: Real-time window only (no output path specified)\n");
   } else {
     // 既显示又保存
     g_enable_display = true;
-    NNDEPLOY_LOGI("Display mode: Real-time window + save to file");
+    NNDEPLOY_LOGI("Display mode: Real-time window + save to file\n");
   }
 
-  NNDEPLOY_LOGI("===== RTSP + YOLO Real-time Detection =====");
-  NNDEPLOY_LOGI("Input (RTSP): %s", input_path.c_str());
+  NNDEPLOY_LOGI("===== RTSP + YOLO Real-time Detection =====\n");
+  NNDEPLOY_LOGI("Input (RTSP): %s\n", input_path.c_str());
   if (save_to_file) {
-    NNDEPLOY_LOGI("Output: %s", output_path.c_str());
+    NNDEPLOY_LOGI("Output: %s\n", output_path.c_str());
   } else {
-    NNDEPLOY_LOGI("Output: Display only (no file)");
+    NNDEPLOY_LOGI("Output: Display only (no file)\n");
   }
-  NNDEPLOY_LOGI("Model: %s", model_value[0].c_str());
-  NNDEPLOY_LOGI("Device: %s", base::deviceTypeToString(device_type).c_str());
-  NNDEPLOY_LOGI("Inference: %s",
+  NNDEPLOY_LOGI("Model: %s\n", model_value[0].c_str());
+  NNDEPLOY_LOGI("Device: %s\n", base::deviceTypeToString(device_type).c_str());
+  NNDEPLOY_LOGI("Inference: %s\n",
                 base::inferenceTypeToString(inference_type).c_str());
 
   // 创建DAG边
-  NNDEPLOY_LOGI("Creating DAG edges...");
+  NNDEPLOY_LOGI("Creating DAG edges...\n");
   dag::Edge *input = nullptr;
   dag::Edge *detect_result = nullptr;
   dag::Edge *vis_output = nullptr;
 
   try {
     input = new dag::Edge("decode_out");
-    NNDEPLOY_LOGI("Created input edge: %p", input);
+    NNDEPLOY_LOGI("Created input edge: %p\n", input);
 
     detect_result = new dag::Edge("detect_out");
-    NNDEPLOY_LOGI("Created detect_result edge: %p", detect_result);
+    NNDEPLOY_LOGI("Created detect_result edge: %p\n", detect_result);
 
     vis_output = new dag::Edge("vis_out");
-    NNDEPLOY_LOGI("Created vis_output edge: %p", vis_output);
+    NNDEPLOY_LOGI("Created vis_output edge: %p\n", vis_output);
   } catch (...) {
-    NNDEPLOY_LOGE("Failed to create edges");
+    NNDEPLOY_LOGE("Failed to create edges\n");
     return -1;
   }
 
   // 创建Graph
-  NNDEPLOY_LOGI("Creating graph...");
+  NNDEPLOY_LOGI("Creating graph...\n");
   dag::Graph *graph = new dag::Graph("rtsp_yolo_demo", {}, {});
   if (graph == nullptr) {
-    NNDEPLOY_LOGE("Failed to create graph");
+    NNDEPLOY_LOGE("Failed to create graph\n");
     return -1;
   }
 
   // 1. 视频解码节点（支持RTSP over TCP + GPU硬解）
-  NNDEPLOY_LOGI("Creating decode node with GPU hardware decode...");
+  NNDEPLOY_LOGI("Creating decode node with GPU hardware decode...\n");
   codec::Decode *decode_node = nullptr;
   try {
     // 使用自定义的RTSP解码器，启用GPU硬件解码
     decode_node = new RtspVideoDecode("decode_node", input, true);  // true = 启用GPU解码
-    NNDEPLOY_LOGI("Decode node created: %p", decode_node);
+    NNDEPLOY_LOGI("Decode node created: %p\n", decode_node);
   } catch (const std::exception& e) {
-    NNDEPLOY_LOGE("Exception creating decode node: %s", e.what());
+    NNDEPLOY_LOGE("Exception creating decode node: %s\n", e.what());
     return -1;
   } catch (...) {
-    NNDEPLOY_LOGE("Unknown exception creating decode node");
+    NNDEPLOY_LOGE("Unknown exception creating decode node\n");
     return -1;
   }
 
   if (decode_node == nullptr) {
-    NNDEPLOY_LOGE("Failed to create decode node - returned nullptr");
+    NNDEPLOY_LOGE("Failed to create decode node - returned nullptr\n");
     return -1;
   }
 
-  NNDEPLOY_LOGI("Adding decode node to graph...");
+  NNDEPLOY_LOGI("Adding decode node to graph...\n");
   graph->addNode(decode_node);
-  NNDEPLOY_LOGI("Decode node added successfully");
+  NNDEPLOY_LOGI("Decode node added successfully\n");
 
   // 2. YOLO检测Graph
-  NNDEPLOY_LOGI("Creating YOLO graph...");
+  NNDEPLOY_LOGI("Creating YOLO graph...\n");
   detect::YoloGraph *yolo_graph =
       new detect::YoloGraph(name, {input}, {detect_result});
   if (yolo_graph == nullptr) {
-    NNDEPLOY_LOGE("Failed to create YOLO graph");
+    NNDEPLOY_LOGE("Failed to create YOLO graph\n");
     return -1;
   }
 
@@ -639,34 +721,34 @@ int main(int argc, char *argv[]) {
   graph->addNode(yolo_graph);
 
   // 3. 可视化节点
-  NNDEPLOY_LOGI("Creating visualization node...");
+  NNDEPLOY_LOGI("Creating visualization node...\n");
   dag::Node *vis_node =
       graph->createNode<VisDetection>("vis_node", {input, detect_result},
                                       {vis_output});
   if (vis_node == nullptr) {
-    NNDEPLOY_LOGE("Failed to create visualization node");
+    NNDEPLOY_LOGE("Failed to create visualization node\n");
     return -1;
   }
 
   // 4. 视频编码节点（只在需要保存文件时创建）
   codec::Encode *encode_node = nullptr;
   if (save_to_file) {
-    NNDEPLOY_LOGI("Creating encode node...");
+    NNDEPLOY_LOGI("Creating encode node...\n");
     encode_node = codec::createEncode(
         base::kCodecTypeOpenCV, codec_flag, "encode_node", vis_output);
     if (encode_node == nullptr) {
-      NNDEPLOY_LOGE("Failed to create encode node");
+      NNDEPLOY_LOGE("Failed to create encode node\n");
       return -1;
     }
     graph->addNode(encode_node);
   } else {
-    NNDEPLOY_LOGI("Skipping encode node (display only mode)");
+    NNDEPLOY_LOGI("Skipping encode node (display only mode)\n");
   }
 
   // 设置并行模式
   base::Status status = graph->setParallelType(pt);
   if (status != base::kStatusCodeOk) {
-    NNDEPLOY_LOGE("Failed to set parallel type");
+    NNDEPLOY_LOGE("Failed to set parallel type\n");
     return -1;
   }
 
@@ -676,7 +758,7 @@ int main(int argc, char *argv[]) {
   NNDEPLOY_TIME_POINT_START("graph->init()");
   status = graph->init();
   if (status != base::kStatusCodeOk) {
-    NNDEPLOY_LOGE("Failed to initialize graph");
+    NNDEPLOY_LOGE("Failed to initialize graph\n");
     return -1;
   }
   NNDEPLOY_TIME_POINT_END("graph->init()");
@@ -696,14 +778,14 @@ int main(int argc, char *argv[]) {
   int frame_count = 0;
   int max_frames = decode_node->getSize();  // 如果是RTSP流，这可能是-1
 
-  NNDEPLOY_LOGI("Starting inference loop...");
-  NNDEPLOY_LOGI("Press Ctrl+C to stop");
+  NNDEPLOY_LOGI("Starting inference loop...\n");
+  NNDEPLOY_LOGI("Press Ctrl+C to stop\n");
 
   // 对于RTSP流，循环直到流结束或用户中断
   while (true) {
     status = graph->run();
     if (status != base::kStatusCodeOk) {
-      NNDEPLOY_LOGI("Stream ended or error occurred, exiting...");
+      NNDEPLOY_LOGI("Stream ended or error occurred, exiting...\n");
       break;
     }
 
@@ -716,7 +798,7 @@ int main(int argc, char *argv[]) {
       if (result != nullptr) {
         // 可选：打印检测统计
         if (frame_count % 30 == 0) {  // 每30帧打印一次
-          NNDEPLOY_LOGI("Frame %d: Detected %zu objects", frame_count,
+          NNDEPLOY_LOGI("Frame %d: Detected %zu objects\n", frame_count,
                         result->bboxs_.size());
         }
       }
@@ -724,18 +806,18 @@ int main(int argc, char *argv[]) {
 
     // 如果指定了最大帧数（用于测试）
     if (max_frames > 0 && frame_count >= max_frames) {
-      NNDEPLOY_LOGI("Reached max frames: %d", max_frames);
+      NNDEPLOY_LOGI("Reached max frames: %d\n", max_frames);
       break;
     }
   }
   NNDEPLOY_TIME_POINT_END("graph->run");
 
-  NNDEPLOY_LOGI("Processed %d frames", frame_count);
+  NNDEPLOY_LOGI("Processed %d frames\n", frame_count);
 
   // 反初始化
   status = graph->deinit();
   if (status != base::kStatusCodeOk) {
-    NNDEPLOY_LOGE("Failed to deinitialize graph");
+    NNDEPLOY_LOGE("Failed to deinitialize graph\n");
     return -1;
   }
 
@@ -753,12 +835,7 @@ int main(int argc, char *argv[]) {
   delete yolo_graph;
   delete graph;
 
-  // 关闭OpenCV窗口
-  if (g_enable_display) {
-    cv::destroyAllWindows();
-  }
-
-  NNDEPLOY_LOGI("Demo finished successfully!");
+  NNDEPLOY_LOGI("Demo finished successfully!\n");
 
   return 0;
 }

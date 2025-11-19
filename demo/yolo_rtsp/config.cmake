@@ -8,8 +8,12 @@ set(DEPEND_LIBRARY)
 set(SYSTEM_LIBRARY)
 set(THIRD_PARTY_LIBRARY)
 
+# Enable CUDA for GPU drawing kernels
+enable_language(CUDA)
+
 # include
 include_directories(${ROOT_PATH}/demo)
+include_directories(${ROOT_PATH}/demo/yolo_rtsp)
 
 # SOURCE
 file(GLOB_RECURSE SOURCE
@@ -20,7 +24,13 @@ file(GLOB DEMO_SOURCE
   "${ROOT_PATH}/demo/*.h"
   "${ROOT_PATH}/demo/*.cc"
 )
-set(SOURCE ${SOURCE} ${DEMO_SOURCE})
+
+# CUDA kernel source
+file(GLOB CUDA_SOURCE
+  "${ROOT_PATH}/demo/yolo_rtsp/*.cu"
+)
+
+set(SOURCE ${SOURCE} ${DEMO_SOURCE} ${CUDA_SOURCE})
 set(SOURCE ${SOURCE} ${ROOT_PATH}/plugin/source/nndeploy/force_link.cc)
 
 # OBJECT
@@ -64,6 +74,26 @@ pkg_check_modules(LIBAV REQUIRED
 )
 include_directories(${LIBAV_INCLUDE_DIRS})
 list(APPEND THIRD_PARTY_LIBRARY ${LIBAV_LIBRARIES})
+
+# CUDA libraries for GPU drawing
+find_package(CUDA REQUIRED)
+include_directories(${CUDA_INCLUDE_DIRS})
+list(APPEND THIRD_PARTY_LIBRARY ${CUDA_LIBRARIES} ${CUDA_CUDART_LIBRARY})
+
+# OpenGL, GLEW and GLFW for GPU-direct display
+find_package(OpenGL REQUIRED)
+find_package(GLEW REQUIRED)
+find_package(glfw3 REQUIRED)
+find_package(Freetype REQUIRED)
+find_package(glm REQUIRED)
+include_directories(${OPENGL_INCLUDE_DIR} ${GLEW_INCLUDE_DIRS} ${FREETYPE_INCLUDE_DIRS})
+list(APPEND THIRD_PARTY_LIBRARY ${OPENGL_LIBRARIES} ${GLEW_LIBRARIES} glfw ${FREETYPE_LIBRARIES})
+
+# Set CUDA properties for the target
+set_target_properties(${BINARY} PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
 
 target_link_libraries(${BINARY} ${THIRD_PARTY_LIBRARY})
 # install
